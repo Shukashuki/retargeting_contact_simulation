@@ -1,0 +1,28 @@
+# Data (symlinks point to local paths, not for version control)
+data/oakink2
+data/oakink
+data/recordings/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+*.egg
+
+# Output files (keep directory structure, ignore generated content)
+outputs/*.h5
+outputs/*.mp4
+outputs/*.npy
+outputs/*.npz
+outputs/recordings/
+!outputs/.gitkeep
+!third_party/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store

@@ -1,0 +1,6 @@
+[submodule "third_party/spider"]
+	path = third_party/spider
+	url = https://github.com/facebookresearch/spider.git
+[submodule "third_party/wuji-retargeting"]
+	path = third_party/wuji-retargeting
+	url = https://github.com/wuji-technology/wuji-retargeting.git
