@@ -9,7 +9,6 @@ Usage:
 
 import argparse
 import os
-import sys
 import pickle
 
 import numpy as np
@@ -17,10 +16,7 @@ import torch
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-WUJI_PKG  = os.path.join(REPO_ROOT, "third_party", "wuji-retargeting")
 MANO_ROOT = "/home/roy/externalTool/data/OakInk2/asset/mano_v1_2"
-
-sys.path.insert(0, WUJI_PKG)
 
 FPS       = 30
 SUBSAMPLE = 4   # 120 Hz mocap → ~30 Hz
@@ -38,7 +34,6 @@ def load_anno(pkl_path: str, subsample: int = SUBSAMPLE):
 
 def run_mano_fk(data, frames):
     """Run MANO forward kinematics, return (T, 21, 3) world-space joints for each hand."""
-    os.chdir("/home/roy/externalTool/data/OakInk2")   # manotorch editable install path
     from manotorch.manolayer import ManoLayer
 
     mano_r = ManoLayer(rot_mode="quat", side="right", mano_assets_root=MANO_ROOT, flat_hand_mean=False)
@@ -85,6 +80,9 @@ def main():
     parser.add_argument("--output", default=os.path.join(REPO_ROOT, "outputs", "wuji_qpos.npy"))
     parser.add_argument("--subsample", type=int, default=SUBSAMPLE)
     args = parser.parse_args()
+    # resolve to absolute paths immediately (before any os.chdir that might happen)
+    args.config = os.path.abspath(args.config)
+    args.output = os.path.abspath(args.output)
 
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
 
