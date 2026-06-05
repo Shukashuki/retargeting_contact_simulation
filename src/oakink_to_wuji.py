@@ -1,9 +1,15 @@
 """
 OakInk v2 anno_preview pkl → Wuji Hand qpos sequence (via wuji-retargeting)
 
+Output shape: (T, 52) — matches SPIDER 6DOF-wrist bimanual model
+  [0:6]   right wrist (tx,ty,tz from MANO tsl + rx,ry,rz from MANO global rot)
+  [6:26]  right finger joints (20 DOF from wuji-retargeting)
+  [26:32] left wrist
+  [32:52] left finger joints
+
 Usage:
     python src/oakink_to_wuji.py --pkl <path_to_anno.pkl> \
-        --config configs/wuji_retarget.yaml \
+        --config configs/wuji_retarget_right.yaml \
         --output outputs/wuji_qpos.npy
 """
 
@@ -13,6 +19,7 @@ import pickle
 
 import numpy as np
 import torch
+from scipy.spatial.transform import Rotation
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -56,6 +63,41 @@ def run_mano_fk(data, frames):
     return rh_joints, lh_joints
 
 
+def wrist_pose_to_6dof(tsl: np.ndarray, pose_coeffs: np.ndarray) -> np.ndarray:
+    """
+    Convert MANO wrist world pose to SPIDER 6DOF wrist joint values.
+
+    SPIDER wrist chain axes (right hand):
+      R_wrist_tx_joint: slide  x
+      R_wrist_ty_joint: slide  y
+      R_wrist_tz_joint: slide  z
+      R_wrist_rx_joint: revolute  z  (axis="0 0 1")
+      R_wrist_ry_joint: revolute  x  (axis="1 0 0")
+      R_wrist_rz_joint: revolute -y  (axis="0 -1 0")
+
+    The chain produces rotation Rz(α) · Rx(β) · R(-y)(γ) = Rz(α) · Rx(β) · Ry(-γ).
+    This matches a ZXY intrinsic Euler decomposition with the last angle negated.
+
+    Args:
+        tsl         : (T, 3)    MANO wrist world translation
+        pose_coeffs : (T, 16, 4) MANO pose quaternions; index 0 = global orientation [x,y,z,w]
+    Returns:
+        wrist_6dof  : (T, 6)   [tx, ty, tz, rx, ry, rz]
+    """
+    T = tsl.shape[0]
+    wrist_6dof = np.zeros((T, 6), dtype=np.float32)
+    wrist_6dof[:, :3] = tsl  # translation directly from MANO
+
+    # Global orientation quaternion: MANO stores [x,y,z,w] in pose_coeffs[:,0,:]
+    global_quat_xyzw = pose_coeffs[:, 0, :]          # (T, 4)
+    rot = Rotation.from_quat(global_quat_xyzw)        # scipy convention: [x,y,z,w]
+    euler_zxy = rot.as_euler('ZXY', degrees=False)    # (T, 3): [α_z, β_x, γ_y]
+    wrist_6dof[:, 3] = euler_zxy[:, 0]                # rx_joint (axis Z)
+    wrist_6dof[:, 4] = euler_zxy[:, 1]                # ry_joint (axis X)
+    wrist_6dof[:, 5] = -euler_zxy[:, 2]               # rz_joint (axis -Y, negated)
+    return wrist_6dof
+
+
 def retarget_sequence(joints_T21x3: np.ndarray, config_path: str, hand_side: str) -> np.ndarray:
     """
     joints_T21x3 : (T, 21, 3) world-space MANO joints
@@ -90,16 +132,28 @@ def main():
     data, frames, obj_list = load_anno(args.pkl, args.subsample)
     print(f"幀數: {len(frames)}, 物件: {obj_list}", flush=True)
 
-    print("執行 MANO FK...", flush=True)
+    print("Running MANO FK...", flush=True)
     rh_joints, lh_joints = run_mano_fk(data, frames)   # (T, 21, 3) each
 
-    print("Retargeting → Wuji Hand...", flush=True)
-    rh_qpos = retarget_sequence(rh_joints, args.config, hand_side="right")  # (T, 20)
-    lh_qpos = retarget_sequence(lh_joints, args.config, hand_side="left")   # (T, 20)
+    # Extract wrist world pose from raw MANO data
+    rh_tsl  = np.stack([data["raw_mano"][f]["rh__tsl"][0].numpy()          for f in frames])  # (T, 3)
+    lh_tsl  = np.stack([data["raw_mano"][f]["lh__tsl"][0].numpy()          for f in frames])
+    rh_pose = np.stack([data["raw_mano"][f]["rh__pose_coeffs"][0].numpy()  for f in frames])  # (T, 16, 4)
+    lh_pose = np.stack([data["raw_mano"][f]["lh__pose_coeffs"][0].numpy()  for f in frames])
 
-    qpos_bimanual = np.concatenate([rh_qpos, lh_qpos], axis=1)   # (T, 40)
+    rh_wrist6 = wrist_pose_to_6dof(rh_tsl, rh_pose)   # (T, 6)
+    lh_wrist6 = wrist_pose_to_6dof(lh_tsl, lh_pose)   # (T, 6)
+
+    print("Retargeting fingers → Wuji Hand...", flush=True)
+    rh_fingers = retarget_sequence(rh_joints, args.config, hand_side="right")  # (T, 20)
+    lh_fingers = retarget_sequence(lh_joints, args.config, hand_side="left")   # (T, 20)
+
+    # Assemble (T, 52): [wrist6_R | fingers20_R | wrist6_L | fingers20_L]
+    qpos_bimanual = np.concatenate([rh_wrist6, rh_fingers, lh_wrist6, lh_fingers], axis=1)
     np.save(args.output, qpos_bimanual)
-    print(f"儲存: {args.output}  shape={qpos_bimanual.shape}", flush=True)
+    print(f"Saved: {args.output}  shape={qpos_bimanual.shape}", flush=True)
+    print(f"  right wrist pos sample: {rh_wrist6[0, :3].round(3)}", flush=True)
+    print(f"  left  wrist pos sample: {lh_wrist6[0, :3].round(3)}", flush=True)
 
 
 if __name__ == "__main__":
