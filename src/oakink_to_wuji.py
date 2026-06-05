@@ -115,45 +115,84 @@ def retarget_sequence(joints_T21x3: np.ndarray, config_path: str, hand_side: str
     return qpos_seq
 
 
+def obj_transf_to_freejoint(data: dict, frames: list, obj_ids: list) -> np.ndarray:
+    """
+    Extract object world transforms from obj_transf → freejoint qpos (pos3 + quat_wxyz4).
+
+    Args:
+        obj_ids : list of object IDs to extract, in scene qpos order
+    Returns:
+        obj_qpos : (T, len(obj_ids) * 7)
+    """
+    T = len(frames)
+    obj_qpos = np.zeros((T, len(obj_ids) * 7), dtype=np.float32)
+    for j, obj_id in enumerate(obj_ids):
+        transf_dict = data["obj_transf"].get(obj_id, {})
+        for i, fid in enumerate(frames):
+            mat4 = transf_dict.get(fid)
+            if mat4 is None:
+                continue
+            pos = mat4[:3, 3]
+            rot = Rotation.from_matrix(mat4[:3, :3])
+            xyzw = rot.as_quat()                      # scipy: [x,y,z,w]
+            wxyz = np.array([xyzw[3], xyzw[0], xyzw[1], xyzw[2]])
+            obj_qpos[i, j*7:j*7+3] = pos
+            obj_qpos[i, j*7+3:j*7+7] = wxyz
+    return obj_qpos
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--pkl",    required=True, help="anno_preview pkl path")
     parser.add_argument("--config", default=os.path.join(REPO_ROOT, "configs", "wuji_retarget_right.yaml"))
     parser.add_argument("--output", default=os.path.join(REPO_ROOT, "outputs", "wuji_qpos.npy"))
     parser.add_argument("--subsample", type=int, default=SUBSAMPLE)
+    parser.add_argument("--scene-obj-ids", nargs="*", default=None,
+                        help="Object IDs to include in qpos (in scene order). "
+                             "If omitted, all obj_list objects are used.")
     args = parser.parse_args()
-    # resolve to absolute paths immediately (before any os.chdir that might happen)
     args.config = os.path.abspath(args.config)
     args.output = os.path.abspath(args.output)
 
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
 
-    print(f"載入 pkl: {args.pkl}", flush=True)
+    print(f"Loading pkl: {args.pkl}", flush=True)
     data, frames, obj_list = load_anno(args.pkl, args.subsample)
-    print(f"幀數: {len(frames)}, 物件: {obj_list}", flush=True)
+    print(f"Frames: {len(frames)}  Objects: {obj_list}", flush=True)
 
     print("Running MANO FK...", flush=True)
-    rh_joints, lh_joints = run_mano_fk(data, frames)   # (T, 21, 3) each
+    rh_joints, lh_joints = run_mano_fk(data, frames)
 
-    # Extract wrist world pose from raw MANO data
-    rh_tsl  = np.stack([data["raw_mano"][f]["rh__tsl"][0].numpy()          for f in frames])  # (T, 3)
-    lh_tsl  = np.stack([data["raw_mano"][f]["lh__tsl"][0].numpy()          for f in frames])
-    rh_pose = np.stack([data["raw_mano"][f]["rh__pose_coeffs"][0].numpy()  for f in frames])  # (T, 16, 4)
-    lh_pose = np.stack([data["raw_mano"][f]["lh__pose_coeffs"][0].numpy()  for f in frames])
+    rh_tsl  = np.stack([data["raw_mano"][f]["rh__tsl"][0].numpy()         for f in frames])
+    lh_tsl  = np.stack([data["raw_mano"][f]["lh__tsl"][0].numpy()         for f in frames])
+    rh_pose = np.stack([data["raw_mano"][f]["rh__pose_coeffs"][0].numpy() for f in frames])
+    lh_pose = np.stack([data["raw_mano"][f]["lh__pose_coeffs"][0].numpy() for f in frames])
 
-    rh_wrist6 = wrist_pose_to_6dof(rh_tsl, rh_pose)   # (T, 6)
-    lh_wrist6 = wrist_pose_to_6dof(lh_tsl, lh_pose)   # (T, 6)
+    rh_wrist6 = wrist_pose_to_6dof(rh_tsl, rh_pose)
+    lh_wrist6 = wrist_pose_to_6dof(lh_tsl, lh_pose)
 
     print("Retargeting fingers → Wuji Hand...", flush=True)
-    rh_fingers = retarget_sequence(rh_joints, args.config, hand_side="right")  # (T, 20)
-    lh_fingers = retarget_sequence(lh_joints, args.config, hand_side="left")   # (T, 20)
+    rh_fingers = retarget_sequence(rh_joints, args.config, hand_side="right")
+    lh_fingers = retarget_sequence(lh_joints, args.config, hand_side="left")
 
-    # Assemble (T, 52): [wrist6_R | fingers20_R | wrist6_L | fingers20_L]
-    qpos_bimanual = np.concatenate([rh_wrist6, rh_fingers, lh_wrist6, lh_fingers], axis=1)
-    np.save(args.output, qpos_bimanual)
-    print(f"Saved: {args.output}  shape={qpos_bimanual.shape}", flush=True)
-    print(f"  right wrist pos sample: {rh_wrist6[0, :3].round(3)}", flush=True)
-    print(f"  left  wrist pos sample: {lh_wrist6[0, :3].round(3)}", flush=True)
+    # Hand qpos: (T, 52)
+    hand_qpos = np.concatenate([rh_wrist6, rh_fingers, lh_wrist6, lh_fingers], axis=1)
+
+    # Object qpos: (T, n_obj * 7)
+    scene_obj_ids = args.scene_obj_ids if args.scene_obj_ids else obj_list
+    available = [o for o in scene_obj_ids if o in data["obj_transf"]]
+    missing   = [o for o in scene_obj_ids if o not in data["obj_transf"]]
+    if missing:
+        print(f"Warning: objects not in pkl, will be zero: {missing}", flush=True)
+    print(f"Extracting object poses for: {available}", flush=True)
+    obj_qpos = obj_transf_to_freejoint(data, frames, scene_obj_ids)  # (T, n*7)
+
+    # Full qpos: hand (52) + objects (n*7)
+    full_qpos = np.concatenate([hand_qpos, obj_qpos], axis=1)
+    np.save(args.output, full_qpos)
+    print(f"Saved: {args.output}  shape={full_qpos.shape}", flush=True)
+    print(f"  right wrist: {rh_wrist6[0,:3].round(3)}", flush=True)
+    print(f"  obj[0] pos:  {obj_qpos[0,:3].round(3)}", flush=True)
 
 
 if __name__ == "__main__":
