@@ -65,36 +65,34 @@ def run_mano_fk(data, frames):
 
 def wrist_pose_to_6dof(tsl: np.ndarray, pose_coeffs: np.ndarray) -> np.ndarray:
     """
-    Convert MANO wrist world pose to SPIDER 6DOF wrist joint values.
+    Convert MANO wrist world pose to SPIDER 6DOF wrist joint values,
+    applying the OakInk→SPIDER global coordinate transform first:
+        r_global = Rx(π/2)   (Y-up OakInk → Z-up SPIDER)
 
-    SPIDER wrist chain axes (right hand):
-      R_wrist_tx_joint: slide  x
-      R_wrist_ty_joint: slide  y
-      R_wrist_tz_joint: slide  z
-      R_wrist_rx_joint: revolute  z  (axis="0 0 1")
-      R_wrist_ry_joint: revolute  x  (axis="1 0 0")
-      R_wrist_rz_joint: revolute -y  (axis="0 -1 0")
-
-    The chain produces rotation Rz(α) · Rx(β) · R(-y)(γ) = Rz(α) · Rx(β) · Ry(-γ).
-    This matches a ZXY intrinsic Euler decomposition with the last angle negated.
-
-    Args:
-        tsl         : (T, 3)    MANO wrist world translation
-        pose_coeffs : (T, 16, 4) MANO pose quaternions; index 0 = global orientation [x,y,z,w]
-    Returns:
-        wrist_6dof  : (T, 6)   [tx, ty, tz, rx, ry, rz]
+    Wrist offset matches oakink.py:
+        r_wrist_offset = Rx(π/2) · Rz(π)
     """
+    r_global = Rotation.from_euler("xyz", [np.pi / 2, 0, 0])
+    r_wrist_offset = (
+        Rotation.from_euler("xyz", [np.pi / 2, 0, 0])
+        * Rotation.from_euler("xyz", [0, 0, np.pi])
+    )
     T = tsl.shape[0]
     wrist_6dof = np.zeros((T, 6), dtype=np.float32)
-    wrist_6dof[:, :3] = tsl  # translation directly from MANO
 
-    # Global orientation quaternion: MANO stores [x,y,z,w] in pose_coeffs[:,0,:]
-    global_quat_xyzw = pose_coeffs[:, 0, :]          # (T, 4)
-    rot = Rotation.from_quat(global_quat_xyzw)        # scipy convention: [x,y,z,w]
-    euler_zxy = rot.as_euler('ZXY', degrees=False)    # (T, 3): [α_z, β_x, γ_y]
-    wrist_6dof[:, 3] = euler_zxy[:, 0]                # rx_joint (axis Z)
-    wrist_6dof[:, 4] = euler_zxy[:, 1]                # ry_joint (axis X)
-    wrist_6dof[:, 5] = -euler_zxy[:, 2]               # rz_joint (axis -Y, negated)
+    for i in range(T):
+        # Position: apply global rotation
+        wrist_6dof[i, :3] = r_global.apply(tsl[i])
+
+        # Rotation: r_global * MANO_global_rot * r_wrist_offset → ZXY Euler for chain
+        global_quat_xyzw = pose_coeffs[i, 0, :]       # [x,y,z,w]
+        r_mano = Rotation.from_quat(global_quat_xyzw)
+        r_total = r_global * r_mano * r_wrist_offset
+        euler_zxy = r_total.as_euler('ZXY', degrees=False)  # [α_z, β_x, γ_y]
+        wrist_6dof[i, 3] = euler_zxy[0]               # rx_joint (axis Z)
+        wrist_6dof[i, 4] = euler_zxy[1]               # ry_joint (axis X)
+        wrist_6dof[i, 5] = -euler_zxy[2]              # rz_joint (axis -Y, negated)
+
     return wrist_6dof
 
 
@@ -118,12 +116,9 @@ def retarget_sequence(joints_T21x3: np.ndarray, config_path: str, hand_side: str
 def obj_transf_to_freejoint(data: dict, frames: list, obj_ids: list) -> np.ndarray:
     """
     Extract object world transforms from obj_transf → freejoint qpos (pos3 + quat_wxyz4).
-
-    Args:
-        obj_ids : list of object IDs to extract, in scene qpos order
-    Returns:
-        obj_qpos : (T, len(obj_ids) * 7)
+    Applies the same OakInk→SPIDER global rotation as oakink.py: Rx(π/2).
     """
+    r_global = Rotation.from_euler("xyz", [np.pi / 2, 0, 0])
     T = len(frames)
     obj_qpos = np.zeros((T, len(obj_ids) * 7), dtype=np.float32)
     for j, obj_id in enumerate(obj_ids):
@@ -132,8 +127,8 @@ def obj_transf_to_freejoint(data: dict, frames: list, obj_ids: list) -> np.ndarr
             mat4 = transf_dict.get(fid)
             if mat4 is None:
                 continue
-            pos = mat4[:3, 3]
-            rot = Rotation.from_matrix(mat4[:3, :3])
+            pos = r_global.apply(mat4[:3, 3])
+            rot = r_global * Rotation.from_matrix(mat4[:3, :3])
             xyzw = rot.as_quat()                      # scipy: [x,y,z,w]
             wxyz = np.array([xyzw[3], xyzw[0], xyzw[1], xyzw[2]])
             obj_qpos[i, j*7:j*7+3] = pos
@@ -147,6 +142,10 @@ def main():
     parser.add_argument("--config", default=os.path.join(REPO_ROOT, "configs", "wuji_retarget_right.yaml"))
     parser.add_argument("--output", default=os.path.join(REPO_ROOT, "outputs", "wuji_qpos.npy"))
     parser.add_argument("--subsample", type=int, default=SUBSAMPLE)
+    parser.add_argument("--start-frame", type=int, default=0,
+                        help="Start mocap frame index (before subsampling)")
+    parser.add_argument("--end-frame",   type=int, default=-1,
+                        help="End mocap frame index (before subsampling), -1 = all")
     parser.add_argument("--scene-obj-ids", nargs="*", default=None,
                         help="Object IDs to include in qpos (in scene order). "
                              "If omitted, all obj_list objects are used.")
@@ -158,6 +157,9 @@ def main():
 
     print(f"Loading pkl: {args.pkl}", flush=True)
     data, frames, obj_list = load_anno(args.pkl, args.subsample)
+    # Crop to requested frame window
+    end = args.end_frame if args.end_frame >= 0 else len(frames)
+    frames = frames[args.start_frame:end]
     print(f"Frames: {len(frames)}  Objects: {obj_list}", flush=True)
 
     print("Running MANO FK...", flush=True)
