@@ -24,11 +24,18 @@ MAX_CONTACTS = 64
 
 
 def load_spider_traj(npz_path: str) -> np.ndarray:
-    """Load SPIDER mjwp trajectory. Returns (T, nq) qpos array."""
+    """Load SPIDER trajectory. Returns (T, nq) qpos array.
+
+    Supports:
+      - trajectory_mjwp.npz: qpos shape (n_ticks, ctrl_steps, nq)
+      - trajectory_kinematic.npz / trajectory_ikrollout.npz: qpos shape (T, nq)
+    """
     d = np.load(npz_path)
-    qpos = d["qpos"]          # (n_ticks, ctrl_steps, nq)
-    n_ticks, ctrl_steps, nq = qpos.shape
-    return qpos.reshape(n_ticks * ctrl_steps, nq)
+    qpos = d["qpos"]
+    if qpos.ndim == 3:
+        n_ticks, ctrl_steps, nq = qpos.shape
+        return qpos.reshape(n_ticks * ctrl_steps, nq)
+    return qpos  # already (T, nq)
 
 
 def load_wuji_traj(npy_path: str, model_nq: int) -> np.ndarray:
@@ -57,15 +64,40 @@ def load_wuji_traj(npy_path: str, model_nq: int) -> np.ndarray:
     return qpos
 
 
+def _read_contacts(model, mj_data) -> np.ndarray:
+    cf = np.zeros((MAX_CONTACTS, 6), dtype=np.float32)
+    nc = min(mj_data.ncon, MAX_CONTACTS)
+    for c in range(nc):
+        force_local = np.zeros(6)
+        mujoco.mj_contactForce(model, mj_data, c, force_local)
+        frame = mj_data.contact[c].frame.reshape(3, 3)
+        cf[c, :3] = frame @ force_local[:3]
+        cf[c, 3:] = frame @ force_local[3:]
+    return cf
+
+
 def record(scene_xml: str, traj: np.ndarray, output_path: str,
-           method: str, fps: float = 30.0) -> None:
+           method: str, fps: float = 30.0, physics: bool = False) -> None:
     model   = mujoco.MjModel.from_xml_path(scene_xml)
     mj_data = mujoco.MjData(model)
     T   = traj.shape[0]
     nq  = model.nq
+    nu  = model.nu
     ns  = model.nsensordata
+    dt  = 1.0 / fps
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+    if physics:
+        # Physics mode: hand follows PD control, objects respond to gravity/contacts freely.
+        # Sub-step using the model's own timestep to reach each reference frame.
+        sim_dt  = model.opt.timestep              # e.g. 0.002 s
+        nsteps  = max(1, round(dt / sim_dt))      # steps per reference frame
+        print(f"  physics mode: sim_dt={sim_dt:.4f}s  nsteps/frame={nsteps}", flush=True)
+        # Initialise from frame-0 (hand + object initial pose)
+        mj_data.qpos[:nq] = traj[0, :nq]
+        mj_data.qvel[:]   = 0.0
+        mujoco.mj_forward(model, mj_data)
 
     with h5py.File(output_path, "w") as h5:
         meta = h5.create_group("metadata")
@@ -74,6 +106,7 @@ def record(scene_xml: str, traj: np.ndarray, output_path: str,
         meta.attrs["fps"]     = fps
         meta.attrs["nframes"] = T
         meta.attrs["nq"]      = nq
+        meta.attrs["physics"] = int(physics)
 
         ds_qpos = h5.create_dataset("qpos",          shape=(T, nq),              dtype="f4")
         ds_cf   = h5.create_dataset("contact_force",  shape=(T, MAX_CONTACTS, 6), dtype="f4")
@@ -81,33 +114,24 @@ def record(scene_xml: str, traj: np.ndarray, output_path: str,
         ds_sens = h5.create_dataset("sensor",         shape=(T, ns),              dtype="f4")
         ds_time = h5.create_dataset("time",           shape=(T,),                 dtype="f8")
 
-        dt = 1.0 / fps
         for i in range(T):
-            frame_qpos = traj[i, :nq]
-            mj_data.qpos[:] = frame_qpos
-            mujoco.mj_forward(model, mj_data)
+            if physics:
+                # Drive hand joints toward reference; objects evolve freely
+                mj_data.ctrl[:nu] = traj[i, :nu]
+                for _ in range(nsteps):
+                    mujoco.mj_step(model, mj_data)
+            else:
+                mj_data.qpos[:nq] = traj[i, :nq]
+                mujoco.mj_forward(model, mj_data)
 
             ds_qpos[i] = mj_data.qpos.astype(np.float32)
             ds_time[i] = i * dt
             ds_sens[i] = mj_data.sensordata.astype(np.float32)
             ds_ncon[i] = mj_data.ncon
-
-            cf = np.zeros((MAX_CONTACTS, 6), dtype=np.float32)
-            nc = min(mj_data.ncon, MAX_CONTACTS)
-            for c in range(nc):
-                contact = mj_data.contact[c]
-                # Transform contact frame force into world frame
-                force_local = np.zeros(6)
-                mujoco.mj_contactForce(model, mj_data, c, force_local)
-                frame = contact.frame.reshape(3, 3)
-                cf[c, :3] = frame @ force_local[:3]   # force
-                cf[c, 3:] = frame @ force_local[3:]   # torque
-            ds_cf[i] = cf
-
-            mj_data.time += dt
+            ds_cf[i]   = _read_contacts(model, mj_data)
 
         print(f"Saved {T} frames → {output_path}", flush=True)
-        print(f"  nq={nq}  ns={ns}  max_contacts={MAX_CONTACTS}", flush=True)
+        print(f"  nq={nq}  ns={ns}  max_contacts={MAX_CONTACTS}  physics={physics}", flush=True)
 
 
 def main():
@@ -116,7 +140,9 @@ def main():
     parser.add_argument("--traj",   required=True, help=".npz (SPIDER) or .npy (wuji)")
     parser.add_argument("--method", required=True, choices=["spider", "wuji"])
     parser.add_argument("--output", required=True, help="Output .h5 path")
-    parser.add_argument("--fps",    type=float, default=30.0)
+    parser.add_argument("--fps",     type=float, default=30.0)
+    parser.add_argument("--physics", action="store_true",
+                        help="Physics mode: hand follows PD control, objects respond freely")
     args = parser.parse_args()
 
     # Resolve model nq from scene
@@ -130,8 +156,8 @@ def main():
     else:
         traj = load_wuji_traj(args.traj, nq)
 
-    print(f"Frames: {traj.shape[0]}  model nq: {nq}", flush=True)
-    record(args.scene, traj, args.output, method=args.method, fps=args.fps)
+    print(f"Frames: {traj.shape[0]}  model nq: {nq}  physics={args.physics}", flush=True)
+    record(args.scene, traj, args.output, method=args.method, fps=args.fps, physics=args.physics)
 
 
 if __name__ == "__main__":

@@ -12,12 +12,14 @@ __pycache__/
 *.egg
 
 # Output files (keep directory structure, ignore generated content)
-outputs/*.h5
-outputs/*.mp4
-outputs/*.npy
-outputs/*.npz
-outputs/recordings/
+outputs/**/*.h5
+outputs/**/*.mp4
+outputs/**/*.npy
+outputs/**/*.npz
+outputs/recordings*/
 !outputs/.gitkeep
+!outputs/spider/.gitkeep
+!outputs/wuji_retargeting/.gitkeep
 !third_party/
 
 # IDE

@@ -42,8 +42,8 @@ def sensor_to_heatmap_frame(sensor_t: np.ndarray, vmax: float = 10.0) -> np.ndar
 
     fig.tight_layout(pad=1.0)
     fig.canvas.draw()
-    buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-    frame = buf.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+    frame = buf.reshape(fig.canvas.get_width_height()[::-1] + (4,))[:, :, :3]
     plt.close(fig)
     return frame
 
