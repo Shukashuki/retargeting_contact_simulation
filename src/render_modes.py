@@ -6,7 +6,8 @@ Layout (3 rows × 2 panels):
   Row 2: Mode C  [IK ref | sim]
 
 Usage:
-  python src/render_modes.py --out outputs/modes_comparison.mp4
+  python src/render_modes.py --task unscrew_bottle --out outputs/modes_comparison.mp4
+  python src/render_modes.py --task insert_lightbulb --out outputs/insert_lightbulb_modes.mp4
 """
 
 from __future__ import annotations
@@ -14,35 +15,42 @@ import argparse, os
 import cv2, imageio, mujoco
 import numpy as np
 
-SPIDER  = os.path.join(os.path.dirname(__file__), "../third_party/spider")
-RUN_DIR = os.path.join(SPIDER, "example_datasets/processed/oakinkv2/wuji_hand/right/unscrew_bottle/0")
-SCENE     = os.path.join(RUN_DIR, "../scene.xml")
-SCENE_ACT = os.path.join(RUN_DIR, "../scene_act.xml")
-
-MODES = [
-    {
-        "label": "Mode A  qpos tracking",
-        "ref":  {"scene": SCENE,     "npz": os.path.join(RUN_DIR, "trajectory_kinematic.npz"),       "flat": True},
-        "sim":  {"scene": SCENE,     "npz": os.path.join(RUN_DIR, "trajectory_mjwp_no_guidance.npz"), "flat": False},
-    },
-    {
-        "label": "Mode B  contact guidance",
-        "ref":  {"scene": SCENE_ACT, "npz": os.path.join(RUN_DIR, "trajectory_kinematic_act.npz"),   "flat": True},
-        "sim":  {"scene": SCENE_ACT, "npz": os.path.join(RUN_DIR, "trajectory_mjwp_act.npz"),         "flat": False},
-    },
-    {
-        "label": "Mode C  geometric reward",
-        "ref":  {"scene": SCENE,     "npz": os.path.join(RUN_DIR, "trajectory_kinematic.npz"),       "flat": True},
-        "sim":  {"scene": SCENE,     "npz": os.path.join(RUN_DIR, "trajectory_mjwp_cap_contact.npz"), "flat": False},
-    },
-]
+SPIDER = os.path.join(os.path.dirname(__file__), "../third_party/spider")
 
 W, H         = 480, 480
 FPS          = 25
 N_FRAMES     = 196
 RENDER_EVERY = 2
 
-CAP_LOOKAT = np.array([0.036, -0.173, -0.041], dtype=np.float64)
+
+def build_modes(run_dir, scene, scene_act):
+    return [
+        {
+            "label": "Mode A  qpos tracking",
+            "ref":  {"scene": scene,     "npz": os.path.join(run_dir, "trajectory_kinematic.npz"),       "flat": True},
+            "sim":  {"scene": scene,     "npz": os.path.join(run_dir, "trajectory_mjwp_no_guidance.npz"), "flat": False},
+        },
+        {
+            "label": "Mode B  contact guidance",
+            "ref":  {"scene": scene_act, "npz": os.path.join(run_dir, "trajectory_kinematic_act.npz"),   "flat": True},
+            "sim":  {"scene": scene_act, "npz": os.path.join(run_dir, "trajectory_mjwp_act.npz"),         "flat": False},
+        },
+        {
+            "label": "Mode C  geometric reward",
+            "ref":  {"scene": scene,     "npz": os.path.join(run_dir, "trajectory_kinematic.npz"),       "flat": True},
+            "sim":  {"scene": scene,     "npz": os.path.join(run_dir, "trajectory_mjwp_cap_contact.npz"), "flat": False},
+        },
+    ]
+
+
+def compute_lookat(kin_npz):
+    """Estimate lookat from mean object contact position in the IK trajectory."""
+    data = np.load(kin_npz)
+    contact_pos = data["contact_pos"]  # (T, 15, 3) or (T, 10, 3)
+    # indices 0,3,6,9,12 are object contact positions per finger
+    obj_indices = [0, 3, 6, 9, 12]
+    obj_pos = contact_pos[:, obj_indices, :].mean(axis=(0, 1))
+    return obj_pos.astype(np.float64)
 
 
 def make_model_data(scene_path):
@@ -70,6 +78,9 @@ def extract_frames(npz_path, flat, n):
     return frames[:n]
 
 
+_LOOKAT = None  # set in main()
+
+
 def make_cam():
     cam = mujoco.MjvCamera()
     mujoco.mjv_defaultCamera(cam)
@@ -77,7 +88,7 @@ def make_cam():
     cam.distance  = 0.35
     cam.azimuth   = -45
     cam.elevation = -20
-    cam.lookat[:] = CAP_LOOKAT
+    cam.lookat[:] = _LOOKAT
     return cam
 
 
@@ -112,10 +123,19 @@ def add_frame_counter(img, fi):
     return img
 
 
-def main(out):
+def main(out, task, data_id):
+    global _LOOKAT
+    run_dir   = os.path.join(SPIDER, f"example_datasets/processed/oakinkv2/wuji_hand/right/{task}/{data_id}")
+    scene     = os.path.join(run_dir, "../scene.xml")
+    scene_act = os.path.join(run_dir, "../scene_act.xml")
+    modes     = build_modes(run_dir, scene, scene_act)
+    kin_npz   = os.path.join(run_dir, "trajectory_kinematic.npz")
+    _LOOKAT   = compute_lookat(kin_npz)
+    print(f"Lookat: {_LOOKAT}")
+
     # load everything up front
     rows = []
-    for mode in MODES:
+    for mode in modes:
         row = {}
         for side in ("ref", "sim"):
             cfg = mode[side]
@@ -125,7 +145,7 @@ def main(out):
         row["label"] = mode["label"]
         rows.append(row)
 
-    print(f"Rendering {N_FRAMES} frames  ({len(MODES)} modes × 2 panels)...")
+    print(f"Rendering {N_FRAMES} frames  ({len(modes)} modes × 2 panels)...")
     images = []
     for fi in range(N_FRAMES):
         if fi % 25 == 0:
@@ -159,6 +179,8 @@ def main(out):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out", default="outputs/modes_comparison.mp4")
+    parser.add_argument("--task",    default="unscrew_bottle")
+    parser.add_argument("--data-id", default=0, type=int)
+    parser.add_argument("--out",     default="outputs/modes_comparison.mp4")
     args = parser.parse_args()
-    main(args.out)
+    main(args.out, args.task, args.data_id)

@@ -226,6 +226,7 @@ Output: `example_datasets/processed/oakinkv2/wuji_hand/right/<task>/0/trajectory
 | task | seq_token | obj_id |
 |------|-----------|--------|
 | unscrew_bottle | `scene_01__A004++seq__670845b55c2609fd17de__2023-04-28-18-37-09` | O02@0015@00022 |
+| insert_lightbulb | `scene_02__A005++seq__0464d8feaa9838cb010d__2023-04-20-09-31-17` | O02@0028@00001 |
 
 ### unscrew_bottle 實驗軌跡（已完成）
 
@@ -256,9 +257,33 @@ Output: `example_datasets/processed/oakinkv2/wuji_hand/right/<task>/0/trajectory
 
 | 腳本 | 說明 |
 |------|------|
-| `src/render_modes.py` | modes_comparison.mp4，Mode A/B/C 各一對 ref\|sim |
+| `src/render_modes.py` | modes_comparison.mp4，Mode A/B/C 各一對 ref\|sim；`--task` 參數可切換任務 |
 | `src/render_4panel.py` | 4-panel 含指尖 trail overlay |
 | `src/render_ik_compare.py` | standard IK vs act-scene IK 2-panel 比較 |
+
+```bash
+# 切換任務只需改 --task
+python src/render_modes.py --task insert_lightbulb --out outputs/insert_lightbulb_modes.mp4
+python src/render_modes.py --task unscrew_bottle   --out outputs/modes_comparison.mp4
+```
+
+### insert_lightbulb 實驗軌跡（已完成）
+
+存放於 `example_datasets/processed/oakinkv2/wuji_hand/right/insert_lightbulb/0/`：
+
+| 檔案 | Mode | 說明 |
+|------|------|------|
+| `trajectory_kinematic.npz` | MANO IK ref | qpos (T,33) + contact_pos (T,15,3)；scene.xml 的 IK 解 |
+| `trajectory_kinematic_act.npz` | act scene IK ref | qpos (T,32)，contact_pos (T,15,3)；scene_act.xml 的 IK 解 |
+| `trajectory_mjwp_no_guidance.npz` | Mode A | 標準 qpos tracking，無 contact guidance |
+| `trajectory_mjwp_act.npz` | Mode B | contact guidance + free rot_z |
+| `trajectory_mjwp_cap_contact.npz` | Mode C | fingertip + knuckle 幾何 reward |
+
+比較影片：`outputs/insert_lightbulb_modes.mp4`（3 行 × 2 欄，ref|sim，seed=42）
+
+物件：燈泡（O02@0028@00001），mesh 來源：`object_raw.tar` 提取後複製至
+`/home/roy/externalTool/data/oakink/assets/objects/O02@0028@00001/`，
+並 symlink 至 SPIDER `example_datasets/raw/oakink/meshes/O02@0028@00001/`。
 
 ## Known Issues
 
